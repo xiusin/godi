@@ -11,8 +11,15 @@ import (
 	"sync"
 )
 
-var ErrNotSupportedType = fmt.Errorf("unsupported type")
+// 哨兵错误，调用方可通过 errors.Is 精确判别
+var (
+	ErrNotSupportedType   = errors.New("unsupported type")
+	ErrServiceNotExists   = errors.New("service not exists")
+	ErrServiceSingleton   = errors.New("service is singleton, cannot use it with GetWithParams")
+	ErrCircularDependency = errors.New("circular dependency detected")
+)
 
+// AbstractBuilder DI 容器抽象接口
 type AbstractBuilder interface {
 	Bind(any, BuildHandler) *Definition
 	Singleton(any, BuildHandler) *Definition
@@ -22,32 +29,42 @@ type AbstractBuilder interface {
 	Set(any, BuildHandler, bool) *Definition
 	SetWithParams(any, BuildWithHandler) *Definition
 	Add(*Definition)
+	Delete(any) bool
 	Get(any) (any, error)
 	GetWithParams(any, ...any) (any, error)
 	MustGet(any, ...any) any
 	GetDefinition(any) (*Definition, error)
 	Exists(any) bool
+	Names() []string
+	Close() error
 }
-type builder struct {
-	// alias    map[string]string
-	services sync.Map
-}
-type BuildHandler func(builder AbstractBuilder) (any, error)
+
+type BuildHandler     func(builder AbstractBuilder) (any, error)
 type BuildWithHandler func(builder AbstractBuilder, params ...any) (any, error)
 
-//reflect.TypeOf((*logger.AbstractLogger)(nil)).Elem()) 直接反射类型， 后续判断是否可以100%反射pkgPath
+// builder 线程安全的 DI 容器实现。
+//
+// 用 map + RWMutex 替代 sync.Map：DI 容器注册后 key 基本稳定、读远多于写，
+// 且需要点查/迭代/计数，map+RWMutex 在点查与迭代上均优于 sync.Map。
+type builder struct {
+	mu       sync.RWMutex
+	services map[string]*Definition
+}
 
-const formatErrServiceNotExists = "service %s not exists"
-
-var ErrServiceSingleton = errors.New("service is singleton, cannot use it with GetWithParams")
+// New 创建独立容器实例，支持多实例隔离与可测试性
+func New() AbstractBuilder {
+	return &builder{services: make(map[string]*Definition)}
+}
 
 func (b *builder) GetDefinition(serviceAny any) (*Definition, error) {
-	serviceName := ResolveServiceName(serviceAny)
-	service, ok := b.services.Load(serviceName)
+	name := ResolveServiceName(serviceAny)
+	b.mu.RLock()
+	def, ok := b.services[name]
+	b.mu.RUnlock()
 	if !ok {
-		return nil, fmt.Errorf(formatErrServiceNotExists, serviceName)
+		return nil, fmt.Errorf("%w: %s", ErrServiceNotExists, name)
 	}
-	return service.(*Definition), nil
+	return def, nil
 }
 
 func (b *builder) Instance(serviceAny any, instance ...any) *Definition {
@@ -71,148 +88,272 @@ func (b *builder) Singleton(serviceAny any, handler BuildHandler) *Definition {
 }
 
 func (b *builder) Set(serviceAny any, handler BuildHandler, singleton bool) *Definition {
-	var def *Definition
-	serviceName := ResolveServiceName(serviceAny)
-	def = NewDefinition(serviceName, handler, singleton)
-	b.services.Store(def.serviceName, def)
+	def := NewDefinition(ResolveServiceName(serviceAny), handler, singleton)
+	b.mu.Lock()
+	b.services[def.name] = def
+	b.mu.Unlock()
 	return def
 }
 
-func ResolveServiceName(service any) string {
-	switch service := service.(type) {
-	case string:
-		return service
-	case nil:
-		panic(fmt.Errorf("service name nil is not support"))
-	default:
-		typo := reflect.TypeOf(service)
-		if typo.Kind() == reflect.Ptr {
-			return GetFullName(typo)
-		}
-		panic(fmt.Errorf("service name type(%s) is not support", typo.String()))
-	}
-}
-
-func GetFullName(p reflect.Type) string {
-	serviceName := p.String()
-	for p.Kind() == reflect.Ptr {
-		p = p.Elem()
-	}
-	return fmt.Sprintf("%s@%s", p.PkgPath(), serviceName)
-}
-
 func (b *builder) SetWithParams(serviceAny any, handler BuildWithHandler) *Definition {
-	serviceName := ResolveServiceName(serviceAny)
-	def := NewParamsDefinition(serviceName, handler)
-	b.services.Store(def.serviceName, def)
+	def := NewParamsDefinition(ResolveServiceName(serviceAny), handler)
+	b.mu.Lock()
+	b.services[def.name] = def
+	b.mu.Unlock()
 	return def
 }
 
 func (b *builder) Add(def *Definition) {
-	b.services.Store(def.serviceName, def)
+	b.mu.Lock()
+	b.services[def.name] = def
+	b.mu.Unlock()
 }
 
+func (b *builder) Delete(serviceAny any) bool {
+	name := ResolveServiceName(serviceAny)
+	b.mu.Lock()
+	_, ok := b.services[name]
+	delete(b.services, name)
+	b.mu.Unlock()
+	return ok
+}
+
+// Register 修复：使用 receiver b 而非全局 di，否则在非默认容器上注册会落到全局容器
 func (b *builder) Register(providers ...AbstractServiceProvider) {
 	for _, provider := range providers {
-		provider.Register(di)
+		provider.Register(b)
 	}
 }
 
 func (b *builder) Get(serviceAny any) (any, error) {
-	serviceName := ResolveServiceName(serviceAny)
-	service, ok := b.services.Load(serviceName)
+	name := ResolveServiceName(serviceAny)
+	b.mu.RLock()
+	def, ok := b.services[name]
+	b.mu.RUnlock()
 	if !ok {
-		return nil, fmt.Errorf(formatErrServiceNotExists, serviceName)
+		return nil, fmt.Errorf("%w: %s", ErrServiceNotExists, name)
 	}
-	s, err := service.(*Definition).resolve(b)
-	if err != nil {
-		return nil, err
+	// 单例已解析：无锁快路径，跳过 scope 分配与循环依赖检测
+	if def.shared && def.resolved.Load() {
+		return def.instance, nil
 	}
-	return s, nil
+	return b.newScope().getByName(name)
 }
 
 func (b *builder) GetWithParams(serviceAny any, params ...any) (any, error) {
-	serviceName := ResolveServiceName(serviceAny)
-	service, ok := b.services.Load(serviceName)
+	name := ResolveServiceName(serviceAny)
+	b.mu.RLock()
+	def, ok := b.services[name]
+	b.mu.RUnlock()
 	if !ok {
-		return nil, fmt.Errorf(formatErrServiceNotExists, serviceName)
+		return nil, fmt.Errorf("%w: %s", ErrServiceNotExists, name)
 	}
-	if service.(*Definition).IsSingleton() {
-		return nil, ErrServiceSingleton
+	if def.paramsFactory == nil {
+		return nil, fmt.Errorf("%w: %s", ErrServiceSingleton, name)
 	}
-	s, err := service.(*Definition).resolveWithParams(b, params...)
-	if err != nil {
-		return nil, err
-	}
-	return s, nil
+	return b.newScope().getWithParamsByName(name, params...)
 }
 
 func (b *builder) MustGet(serviceAny any, params ...any) any {
-	var s any
-	var err error
-	serviceName := ResolveServiceName(serviceAny)
+	var (
+		v   any
+		err error
+	)
 	if len(params) == 0 {
-		s, err = b.Get(serviceName)
+		v, err = b.Get(serviceAny)
 	} else {
-		s, err = b.GetWithParams(serviceName, params...)
+		v, err = b.GetWithParams(serviceAny, params...)
 	}
 	if err != nil {
 		panic(err)
 	}
-	return s
+	return v
 }
 
+// Exists 修复：原实现用 sync.Map.Range 全表扫描 O(n)，改为点查 O(1)
 func (b *builder) Exists(serviceAny any) bool {
-	var exists = false
-	serviceName := ResolveServiceName(serviceAny)
-	b.services.Range(func(key, value any) bool {
-		if key.(string) == serviceName {
-			exists = true
-			return false
+	b.mu.RLock()
+	_, ok := b.services[ResolveServiceName(serviceAny)]
+	b.mu.RUnlock()
+	return ok
+}
+
+func (b *builder) Names() []string {
+	b.mu.RLock()
+	names := make([]string, 0, len(b.services))
+	for n := range b.services {
+		names = append(names, n)
+	}
+	b.mu.RUnlock()
+	return names
+}
+
+// Close 释放所有已构造单例持有的资源（实现 Disposable 的实例）
+func (b *builder) Close() error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	var errs []error
+	for _, def := range b.services {
+		if err := def.dispose(); err != nil {
+			errs = append(errs, err)
 		}
-		return true
-	})
-	return exists
+	}
+	return errors.Join(errs...)
 }
 
-var di = &builder{}
-
-func GetDefaultDI() AbstractBuilder {
-	return di
+func (b *builder) newScope() *resolveScope {
+	return &resolveScope{builder: b, visiting: make(map[string]struct{}, 4)}
 }
 
-func Get(serviceAny any) (any, error) {
-	return di.Get(serviceAny)
+// ---- 服务名解析 ----
+
+// nameCache 缓存 reflect.Type -> 服务名，避免每次 Get 都走反射
+var nameCache sync.Map
+
+func ResolveServiceName(service any) string {
+	switch s := service.(type) {
+	case string:
+		return s
+	case nil:
+		panic("service name nil is not support")
+	default:
+		t := reflect.TypeOf(service)
+		if v, ok := nameCache.Load(t); ok {
+			return v.(string)
+		}
+		if t.Kind() != reflect.Ptr {
+			panic(fmt.Errorf("service name type(%s) is not support", t.String()))
+		}
+		name := GetFullName(t)
+		nameCache.Store(t, name)
+		return name
+	}
 }
 
-func MustGet(serviceAny any, params ...any) any {
-	return di.MustGet(serviceAny, params...)
+// GetFullName 去掉 fmt.Sprintf，用字符串拼接减少分配
+func GetFullName(p reflect.Type) string {
+	name := p.String()
+	for p.Kind() == reflect.Ptr {
+		p = p.Elem()
+	}
+	return p.PkgPath() + "@" + name
 }
 
-func Exists(serviceAny any) bool {
-	return di.Exists(serviceAny)
+// ---- resolveScope：解析作用域，承载循环依赖检测 ----
+//
+// 工厂函数接收的 AbstractBuilder 即为该 scope，其 Get/GetWithParams/MustGet
+// 会维护本条解析链的 visiting 集合，从而在加锁“之前”识别循环依赖，避免持锁
+// 重入导致的死锁。其余方法（注册/查询元数据/Close 等）通过内嵌 *builder 透传
+// 到容器本身。每次顶层 Get 创建独立 scope，并发不同解析链互不干扰（无假阳性）。
+type resolveScope struct {
+	*builder
+	visiting map[string]struct{}
 }
 
-// Remove 移除服务
-func Remove(serviceAny any) {
-	di.services.Delete(ResolveServiceName(serviceAny))
+func (s *resolveScope) Get(serviceAny any) (any, error) {
+	return s.getByName(ResolveServiceName(serviceAny))
 }
 
-// Bind 绑定非共享服务
+func (s *resolveScope) GetWithParams(serviceAny any, params ...any) (any, error) {
+	return s.getWithParamsByName(ResolveServiceName(serviceAny), params...)
+}
+
+func (s *resolveScope) MustGet(serviceAny any, params ...any) any {
+	var (
+		v   any
+		err error
+	)
+	if len(params) == 0 {
+		v, err = s.Get(serviceAny)
+	} else {
+		v, err = s.GetWithParams(serviceAny, params...)
+	}
+	if err != nil {
+		panic(err)
+	}
+	return v
+}
+
+func (s *resolveScope) getByName(name string) (any, error) {
+	if _, cyc := s.visiting[name]; cyc {
+		return nil, fmt.Errorf("%w: %s", ErrCircularDependency, name)
+	}
+	s.builder.mu.RLock()
+	def, ok := s.builder.services[name]
+	s.builder.mu.RUnlock()
+	if !ok {
+		return nil, fmt.Errorf("%w: %s", ErrServiceNotExists, name)
+	}
+	s.visiting[name] = struct{}{}
+	defer delete(s.visiting, name)
+	return def.resolve(s)
+}
+
+func (s *resolveScope) getWithParamsByName(name string, params ...any) (any, error) {
+	if _, cyc := s.visiting[name]; cyc {
+		return nil, fmt.Errorf("%w: %s", ErrCircularDependency, name)
+	}
+	s.builder.mu.RLock()
+	def, ok := s.builder.services[name]
+	s.builder.mu.RUnlock()
+	if !ok {
+		return nil, fmt.Errorf("%w: %s", ErrServiceNotExists, name)
+	}
+	if def.paramsFactory == nil {
+		return nil, fmt.Errorf("%w: %s", ErrServiceSingleton, name)
+	}
+	s.visiting[name] = struct{}{}
+	defer delete(s.visiting, name)
+	return def.resolveWithParams(s, params...)
+}
+
+// ---- 泛型 API（Go 1.18+），消除调用方类型断言 ----
+
+// GetT 类型安全地获取服务。约定 T 为指针类型（与 Bind((*T)(nil)) 注册一致）
+func GetT[T any](b AbstractBuilder) (T, error) {
+	t := reflect.TypeOf((*T)(nil)).Elem()
+	v, err := b.Get(reflect.Zero(t).Interface())
+	if err != nil {
+		var zero T
+		return zero, err
+	}
+	return v.(T), nil
+}
+
+// MustGetT 类型安全地获取服务，失败 panic
+func MustGetT[T any](b AbstractBuilder) T {
+	v, err := GetT[T](b)
+	if err != nil {
+		panic(err)
+	}
+	return v
+}
+
+// ---- 全局默认容器（包级 API 兼容）----
+
+var di = &builder{services: make(map[string]*Definition)}
+
+func GetDefaultDI() AbstractBuilder { return di }
+
+func Get(serviceAny any) (any, error)           { return di.Get(serviceAny) }
+func MustGet(serviceAny any, params ...any) any { return di.MustGet(serviceAny, params...) }
+func Exists(serviceAny any) bool                { return di.Exists(serviceAny) }
+func Remove(serviceAny any)                     { _ = di.Delete(serviceAny) }
+
 func Bind(serviceAny any, handler BuildHandler) *Definition {
 	return di.Bind(serviceAny, handler)
 }
 
-func Bound(serviceAny any) bool {
-	return Exists(serviceAny)
-}
+func Bound(serviceAny any) bool { return Exists(serviceAny) }
 
+// IsShare 修复：原实现 MustGet(...).(*Definition) 类型断言必然 panic；
+// 改为直接读取元数据，且不再因查询而触发构造
 func IsShare(serviceAny any) bool {
-	if Bound(serviceAny) {
-		return (di.MustGet(serviceAny).(*Definition)).IsSingleton()
-	} else {
+	def, err := di.GetDefinition(serviceAny)
+	if err != nil {
 		return false
 	}
+	return def.IsSingleton()
 }
 
 func Set(serviceAny any, handler BuildHandler, singleton bool) *Definition {
@@ -222,9 +363,8 @@ func Set(serviceAny any, handler BuildHandler, singleton bool) *Definition {
 func Attempt(serviceAny any, handler BuildHandler, singleton bool) *Definition {
 	if Bound(serviceAny) {
 		return nil
-	} else {
-		return Set(serviceAny, handler, singleton)
 	}
+	return Set(serviceAny, handler, singleton)
 }
 
 func Instance(serviceAny any, instance ...any) *Definition {
@@ -243,29 +383,30 @@ func Register(providers ...AbstractServiceProvider) {
 	di.Register(providers...)
 }
 
-// InjectOn 作用, 解析object对象内可识别的字段自动注入, 引用服务非数据安全, 需要自行管理
-// object 需要被注入的对象, 仅注入为nil的属性字段
+// InjectOn 解析 object 内可识别的 nil 指针字段并自动注入。
+// 仅注入可导出且当前为 nil 的指针字段；引用服务非数据安全，需自行管理。
+// 修复：原条件 value.Kind()!=Ptr && value.Elem() 在非指针时直接 panic；
+// 且 field.Set 对未导出字段会 panic，这里统一跳过。
 func InjectOn(ptr any) {
-	value := reflect.ValueOf(ptr)
-	if value.Kind() != reflect.Ptr && value.Elem().Kind() != reflect.Struct {
+	v := reflect.ValueOf(ptr)
+	if v.Kind() != reflect.Ptr || v.Elem().Kind() != reflect.Struct {
 		panic(ErrNotSupportedType)
 	}
-
-	for i, fieldNum := 0, value.Elem().NumField(); i < fieldNum; i++ {
-		field := value.Elem().Field(i)
-		if field.Kind() == reflect.Ptr && field.IsNil() {
-			if service, err := di.Get(field.Interface()); err == nil {
-				field.Set(reflect.ValueOf(service))
-			}
+	e := v.Elem()
+	for i := 0; i < e.NumField(); i++ {
+		f := e.Field(i)
+		if f.Kind() != reflect.Ptr || !f.IsNil() {
+			continue
+		}
+		if !f.CanSet() {
+			continue
+		}
+		if svc, err := di.Get(f.Interface()); err == nil {
+			f.Set(reflect.ValueOf(svc))
 		}
 	}
 }
 
 func List() []string {
-	var names []string
-	di.services.Range(func(key, value any) bool {
-		names = append(names, key.(string))
-		return true
-	})
-	return names
+	return di.Names()
 }
