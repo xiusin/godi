@@ -18,10 +18,11 @@ type Disposable interface {
 // Definition 服务定义，描述服务的构造方式与作用域。
 //
 // 不再内嵌 sync.Mutex，避免把 Lock/Unlock 暴露为公开 API（封装修复）。
+// shared 用 atomic.Bool，使 SetShared 与 resolve 之间无数据竞争。
 type Definition struct {
 	name          string
 	typeName      string
-	shared        bool
+	shared        atomic.Bool // 作用域标志，原子读写避免 SetShared 竞争
 	factory       BuildHandler
 	paramsFactory BuildWithHandler
 
@@ -35,11 +36,13 @@ func (d *Definition) TypeName() string { return d.typeName }
 
 func (d *Definition) SetTypeName(call func() string) { d.typeName = call() }
 
-func (d *Definition) SetShared(shared bool) { d.shared = shared }
+// SetShared 原子地修改作用域。建议仅在注册阶段调用；
+// 并发解析期间调用虽不再触发 data race，但语义上可能已对在途解析产生影响。
+func (d *Definition) SetShared(shared bool) { d.shared.Store(shared) }
 
 func (d *Definition) ServiceName() string { return d.name }
 
-func (d *Definition) IsSingleton() bool { return d.shared }
+func (d *Definition) IsSingleton() bool { return d.shared.Load() }
 
 // IsResolved 是否已构造（单例）。用原子标志位判断，允许工厂返回 nil 实例
 func (d *Definition) IsResolved() bool { return d.resolved.Load() }
@@ -48,11 +51,11 @@ func (d *Definition) IsResolved() bool { return d.resolved.Load() }
 //   - 单例：双重检查 + 锁，保证只构造一次；构造失败不缓存，允许后续重试
 //   - 瞬态：无锁调用 factory，支持高并发
 //
-// 循环依赖检测由 resolveScope.getByName 在加锁前完成，避免持锁期间重入死锁。
+// 循环依赖检测由 resolveScope 在加锁前完成，避免持锁期间重入死锁。
 // 写者执行 d.instance = s 后再 d.resolved.Store(true)，读者先 d.resolved.Load()
 // 再读 d.instance，经 atomic 的 release/acquire 建立 happens-before，无锁快路径安全。
 func (d *Definition) resolve(scope *resolveScope) (any, error) {
-	if !d.shared {
+	if !d.shared.Load() {
 		if d.factory == nil {
 			return nil, fmt.Errorf("%w: %s", ErrServiceNotExists, d.name)
 		}
@@ -86,23 +89,29 @@ func (d *Definition) resolveWithParams(scope *resolveScope, params ...any) (any,
 	return d.paramsFactory(scope, params...)
 }
 
-// dispose 释放单例资源
+// dispose 释放单例资源并重置状态，使容器 Close 后可被重新解析（类似 Spring refresh）。
+// 调用方需保证不与并发 Get 同时进行（Close 是关闭流程，应先停止业务解析）。
 func (d *Definition) dispose() error {
-	if !d.shared || !d.resolved.Load() {
+	if !d.shared.Load() || !d.resolved.Load() {
 		return nil
 	}
+	var err error
 	if c, ok := d.instance.(Disposable); ok {
-		return c.Dispose()
+		err = c.Dispose()
 	}
-	return nil
+	// 重置：先清实例引用，再清标志位（读者先查标志位，false 即不会读到 nil 实例）
+	d.instance = nil
+	d.resolved.Store(false)
+	return err
 }
 
 func NewDefinition(name string, factory BuildHandler, shared bool) *Definition {
-	return &Definition{
+	d := &Definition{
 		name:    name,
 		factory: factory,
-		shared:  shared,
 	}
+	d.shared.Store(shared)
+	return d
 }
 
 // NewParamsDefinition 带参服务：每次调用都重新构造，不是单例
@@ -111,6 +120,5 @@ func NewParamsDefinition(name string, factory BuildWithHandler) *Definition {
 	return &Definition{
 		name:          name,
 		paramsFactory: factory,
-		shared:        false,
 	}
 }
