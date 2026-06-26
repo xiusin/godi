@@ -162,6 +162,18 @@ func (b *builder) Delete(serviceAny any) bool {
 	_, ok := b.services[name]
 	delete(b.services, name)
 	b.mu.Unlock()
+	if ok {
+		// 清理依赖图残留边，避免长期 Delete+Set 导致 deps 膨胀
+		b.depsMu.Lock()
+		delete(b.deps, name)
+		for from, tos := range b.deps {
+			delete(tos, name)
+			if len(tos) == 0 {
+				delete(b.deps, from)
+			}
+		}
+		b.depsMu.Unlock()
+	}
 	return ok
 }
 
@@ -472,21 +484,10 @@ func (s *resolveScope) cyclic(name string) string {
 	return ""
 }
 
-// pathSnapshot 返回当前解析栈快照，用于错误诊断
-func (s *resolveScope) pathSnapshot() []string {
-	snap := make([]string, 0, s.sp+len(s.overflow))
-	snap = append(snap, s.stack[:s.sp]...)
-	return snap
-}
-
 func (s *resolveScope) Get(serviceAny any) (any, error) {
 	name := ResolveServiceName(serviceAny)
 	if chain := s.cyclic(name); chain != "" {
 		return nil, fmt.Errorf("%w: %s", ErrCircularDependency, chain)
-	}
-	// 依赖图记录：栈顶是当前正在构造的服务，它依赖 name
-	if s.sp > 0 {
-		s.builder.recordDep(s.stack[s.sp-1], name)
 	}
 	s.builder.mu.RLock()
 	def, ok := s.builder.services[name]
@@ -496,6 +497,10 @@ func (s *resolveScope) Get(serviceAny any) (any, error) {
 			return s.builder.parent.Get(serviceAny)
 		}
 		return nil, fmt.Errorf("%w: %s", ErrServiceNotExists, name)
+	}
+	// 依赖图记录：仅记录单例→单例边（瞬态不参与 Close 销毁，记录无意义且致 deps 膨胀）
+	if s.sp > 0 && def.shared.Load() {
+		s.builder.recordDep(s.stack[s.sp-1], name)
 	}
 	if def.shared.Load() && def.resolved.Load() {
 		return def.instance, nil
@@ -510,9 +515,6 @@ func (s *resolveScope) GetWithParams(serviceAny any, params ...any) (any, error)
 	name := ResolveServiceName(serviceAny)
 	if chain := s.cyclic(name); chain != "" {
 		return nil, fmt.Errorf("%w: %s", ErrCircularDependency, chain)
-	}
-	if s.sp > 0 {
-		s.builder.recordDep(s.stack[s.sp-1], name)
 	}
 	s.builder.mu.RLock()
 	def, ok := s.builder.services[name]
@@ -625,6 +627,11 @@ func Register(providers ...AbstractServiceProvider) {
 
 // PreWarm 预热全局容器
 func PreWarm() error { return di.PreWarm() }
+
+// Close 关闭全局容器，释放所有已构造单例（按依赖逆序销毁）。
+// 用包级 API（Bind/Singleton/Instance 等）注册的 Disposable 单例，
+// 必须通过本函数或 GetDefaultDI().Close() 释放，否则资源泄漏。
+func Close() error { return di.Close() }
 
 // Alias 为全局容器注册别名
 func Alias(alias, target any) *Definition { return di.Alias(alias, target) }

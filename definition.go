@@ -119,10 +119,14 @@ func (d *Definition) resolveWithParams(scope *resolveScope, params ...any) (any,
 	return s, nil
 }
 
-// callInit 若实例实现 Initializer 则调用 Init
+// callInit 若实例实现 Initializer 则调用 Init。
+// 失败时用 ErrInitFailed wrap，使调用方可通过 errors.Is(err, ErrInitFailed) 精确判别
+// "初始化失败"与"构造失败"。
 func callInit(s any) error {
 	if i, ok := s.(Initializer); ok {
-		return i.Init()
+		if err := i.Init(); err != nil {
+			return fmt.Errorf("%w: %s: %v", ErrInitFailed, "init", err)
+		}
 	}
 	return nil
 }
