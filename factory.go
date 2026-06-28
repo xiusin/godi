@@ -166,16 +166,7 @@ func (f *DefaultBeanFactory) GetBeanPostProcessors() []BeanPostProcessor {
 // ---- 获取 bean ----
 
 func (f *DefaultBeanFactory) GetBean(name string) (any, error) {
-	name = f.canonicalName(name)
-	// 先查单例缓存（含二三级 early reference）
-	if obj, ok := f.registry.getSingleton(name); ok {
-		return obj, nil
-	}
-	bd, err := f.GetBeanDefinition(name)
-	if err != nil {
-		return nil, err
-	}
-	return f.doGetBean(name, bd)
+	return f.getBeanByName(name)
 }
 
 func (f *DefaultBeanFactory) doGetBean(name string, bd *BeanDefinition) (any, error) {
@@ -213,14 +204,22 @@ func (f *DefaultBeanFactory) doGetBean(name string, bd *BeanDefinition) (any, er
 
 func (f *DefaultBeanFactory) getBeanByName(name string) (any, error) {
 	name = f.canonicalName(name)
+	// 快路径：本容器单例缓存
 	if obj, ok := f.registry.getSingleton(name); ok {
 		return obj, nil
 	}
-	bd, err := f.GetBeanDefinition(name)
-	if err != nil {
-		return nil, err
+	// 先查本容器定义
+	f.mu.RLock()
+	bd, local := f.beanDefinitions[name]
+	f.mu.RUnlock()
+	if local {
+		return f.doGetBean(name, bd)
 	}
-	return f.doGetBean(name, bd)
+	// 本容器无定义，委托父容器（父容器的 singleton 由父管理，与 Spring 一致）
+	if f.parent != nil {
+		return f.parent.GetBean(name)
+	}
+	return nil, fmt.Errorf("%w: %s", ErrNoSuchBeanDefinition, name)
 }
 
 // createBean 三阶段创建：实例化 → 属性注入 → 初始化。对应 Spring AbstractAutowireCapableBeanFactory.createBean。
@@ -257,25 +256,34 @@ func (f *DefaultBeanFactory) createBean(name string, bd *BeanDefinition) (any, e
 	return initialized, nil
 }
 
-// instantiate 实例化：优先 Factory/Constructor，否则反射 Type 构造
+// instantiate 实例化：优先 Factory/Constructor，否则反射 Type 构造。
+// 若 bd.Type 为空且实例化成功，回填 Type（Spring 式的 beanClass 推断），
+// 这样 byType 查找在首次实例化后即可工作。
 func (f *DefaultBeanFactory) instantiate(bd *BeanDefinition) (any, error) {
-	if bd.Constructor != nil {
-		return bd.Constructor(f)
+	var (
+		bean any
+		err  error
+	)
+	switch {
+	case bd.Constructor != nil:
+		bean, err = bd.Constructor(f)
+	case bd.Factory != nil:
+		bean, err = bd.Factory(f)
+	case bd.Type != nil && bd.Type.Kind() == reflect.Ptr && bd.Type.Elem().Kind() == reflect.Struct:
+		bean = reflect.New(bd.Type.Elem()).Interface()
+	case bd.Type != nil && bd.Type.Kind() == reflect.Struct:
+		bean = reflect.New(bd.Type).Interface()
+	default:
+		return nil, fmt.Errorf("%w: no factory/constructor/type for %s", ErrBeanCreation, bd.Name)
 	}
-	if bd.Factory != nil {
-		return bd.Factory(f)
+	if err != nil {
+		return nil, err
 	}
-	if bd.Type != nil && bd.Type.Kind() == reflect.Ptr {
-		// 反射 New 指针类型：如 *Foo → new(Foo)
-		elem := bd.Type.Elem()
-		if elem.Kind() == reflect.Struct {
-			return reflect.New(elem).Interface(), nil
-		}
+	// 回填 Type：便于后续 byType 查找（Spring 式 beanClass 推断）
+	if bd.Type == nil && bean != nil {
+		bd.Type = reflect.TypeOf(bean)
 	}
-	if bd.Type != nil && bd.Type.Kind() == reflect.Struct {
-		return reflect.New(bd.Type).Interface(), nil // 返回指针便于注入
-	}
-	return nil, fmt.Errorf("%w: no factory/constructor/type for %s", ErrBeanCreation, bd.Name)
+	return bean, nil
 }
 
 // populateBean 属性注入，对应 Spring populateBean。
@@ -496,17 +504,46 @@ func (f *DefaultBeanFactory) nameOfResolved(t reflect.Type) string {
 	return ""
 }
 
-// GetBeanNamesForType 本容器内匹配 type 的 bean 名
+// GetBeanNamesForType 本容器内匹配 type 的 bean 名。
+// 匹配规则（对应 Spring BeanFactory.isTypeMatch）：
+//   - t 是接口：bean 的 Type 或其实例实现该接口
+//   - t 是指针/结构体：bean 的 Type 可赋值给 t
+//   - 若 bean 尚未实例化，用 bean 定义的 Type 判断
 func (f *DefaultBeanFactory) GetBeanNamesForType(t reflect.Type) []string {
 	f.mu.RLock()
 	defer f.mu.RUnlock()
 	out := make([]string, 0)
 	for name, bd := range f.beanDefinitions {
-		if bd.Type != nil && bd.Type == t {
+		if bd.Type == nil {
+			continue
+		}
+		if typeMatches(bd.Type, t) {
 			out = append(out, name)
 		}
 	}
 	return out
+}
+
+// typeMatches 判断 src 类型是否匹配 target 类型（对应 Spring isAssignableFrom）
+func typeMatches(src, target reflect.Type) bool {
+	if src == target {
+		return true
+	}
+	// target 是接口：src 或 *src 实现接口
+	if target.Kind() == reflect.Interface {
+		if src.Implements(target) {
+			return true
+		}
+		// src 是值类型，指针可能实现接口
+		if src.Kind() != reflect.Ptr {
+			if reflect.PtrTo(src).Implements(target) {
+				return true
+			}
+		}
+		return false
+	}
+	// 可赋值性：如 *Concrete → *Base 当 Base 是 Concrete 嵌入类型
+	return src.AssignableTo(target)
 }
 
 // GetBeanNamesForTypeAll 含父容器
