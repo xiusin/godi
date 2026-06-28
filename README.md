@@ -492,23 +492,44 @@ godi.RegisterBean("reqUser", &godi.BeanDefinition{
 
 Go 1.18+ 提供类型安全的泛型 API，消除调用方类型断言。
 
+> **关于泛型方法**：Go 的方法（method）目前不能声明自己的类型参数，因此这些 API 是包级泛型函数。
+> 泛型方法提案（[#77273](https://github.com/golang/go/issues/77273)）已于 2026 年 1 月被接受，
+> 待正式发布后可平滑迁移为 `f.GetBeanT[T]()` 方法形式。
+
 ```go
-// 按类型获取
-db, err := godi.GetBeanT[*DB](f)
+// 按【名称】获取 —— 替代 GetBean(name).(*DB)
+db, err := godi.GetBeanByNameT[*DB](f, "db")
 if err != nil {
     return err
 }
 db.Query(...) // 直接使用，无需类型断言
 
-// 失败 panic
+// 按【名称】获取，失败 panic
+db := godi.MustGetBeanByNameT[*DB](f, "db")
+
+// 按【类型】获取 —— 替代 GetBeanByType(reflect.TypeOf(...))
+db, err := godi.GetBeanT[*DB](f)
+
+// 按【类型】获取，失败 panic
 db := godi.MustGetBeanT[*DB](f)
 
-// 获取某类型所有 bean（泛型集合注入）
+// 接口类型同样适用（byType 自动匹配实现类）
+var log Logger = godi.MustGetBeanT[Logger](f)
+
+// 获取某类型所有 bean（泛型集合注入，对应 Spring List<T>）
 plugins, err := godi.GetBeansT[Plugin](f)
 for name, p := range plugins {
     p.Run()
 }
 ```
+
+| 泛型函数 | 对应非泛型 API | 说明 |
+|---|---|---|
+| `GetBeanByNameT[T](f, name)` | `GetBean(name)` | 按名称 + 类型安全 |
+| `MustGetBeanByNameT[T](f, name)` | `MustGetBean(name)` | 按名称，失败 panic |
+| `GetBeanT[T](f)` | `GetBeanByType(t)` | 按类型 + 类型安全 |
+| `MustGetBeanT[T](f)` | — | 按类型，失败 panic |
+| `GetBeansT[T](f)` | `GetBeansOfType(t)` | 集合注入 |
 
 ---
 

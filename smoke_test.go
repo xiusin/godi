@@ -104,3 +104,36 @@ type LcHook struct {
 
 func (l *LcHook) AfterPropertiesSet() error { l.inited.Store(true); return nil }
 func (l *LcHook) Destroy() error            { l.destroyed.Store(true); return nil }
+
+func TestSmoke_GenericGetByName(t *testing.T) {
+	f := NewDefaultBeanFactory()
+	f.RegisterBeanDefinition("db", &BeanDefinition{
+		Name:    "db",
+		Type:    reflect.TypeOf((*DB1)(nil)),
+		Factory: func(_ BeanFactory) (any, error) { return &DB1{Name: "g"}, nil },
+	})
+	// 类型安全按名称获取
+	db, err := GetBeanByNameT[*DB1](f, "db")
+	if err != nil || db.Name != "g" {
+		t.Fatalf("GetBeanByNameT failed: %v %v", db, err)
+	}
+	// 类型不匹配应返回 ErrBeanNotOfRequiredType
+	_, err = GetBeanByNameT[*Svc1](f, "db")
+	if !errors.Is(err, ErrBeanNotOfRequiredType) {
+		t.Fatalf("expect ErrBeanNotOfRequiredType, got %v", err)
+	}
+}
+
+func TestSmoke_GenericGetByType(t *testing.T) {
+	f := NewDefaultBeanFactory()
+	f.RegisterBeanDefinition("svc", &BeanDefinition{
+		Name:    "svc",
+		Type:    reflect.TypeOf((*Svc1)(nil)),
+		Primary: true,
+		Factory: func(_ BeanFactory) (any, error) { return &Svc1{}, nil },
+	})
+	svc, err := GetBeanT[*Svc1](f)
+	if err != nil || svc == nil {
+		t.Fatalf("GetBeanT failed: %v %v", svc, err)
+	}
+}

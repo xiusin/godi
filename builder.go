@@ -105,8 +105,13 @@ func Refresh() error { return defaultFactory.PreInstantiateSingletons() }
 func Close() error { return defaultFactory.DestroySingletons() }
 
 // ---- 泛型 API（Go 1.18+），消除调用方类型断言 ----
+//
+// 说明：Go 的方法（method）目前不能声明自己的类型参数，因此这些 API 是包级泛型函数
+// 而非 BeanFactory 的方法。Go 泛型方法提案（#77273）已于 2026 年 1 月被接受，
+// 待正式发布后可平滑迁移为 f.GetBeanT[T]() 形式。
 
-// GetBeanT 类型安全地获取 bean。T 应为指针或接口类型。
+// GetBeanT 按【类型】类型安全地获取 bean。T 应为指针或接口类型。
+// 等价于 GetBeanByType，但省去 reflect.TypeOf 与类型断言。
 func GetBeanT[T any](f BeanFactory) (T, error) {
 	var zero T
 	t := reflect.TypeOf((*T)(nil)).Elem()
@@ -121,7 +126,7 @@ func GetBeanT[T any](f BeanFactory) (T, error) {
 	return ct, nil
 }
 
-// MustGetBeanT 类型安全地获取 bean，失败 panic
+// MustGetBeanT 按【类型】类型安全地获取 bean，失败 panic。
 func MustGetBeanT[T any](f BeanFactory) T {
 	v, err := GetBeanT[T](f)
 	if err != nil {
@@ -130,9 +135,32 @@ func MustGetBeanT[T any](f BeanFactory) T {
 	return v
 }
 
-// GetBeansT 获取某类型的所有 bean（泛型集合注入，对应 Spring List<T> 注入）
-func GetBeansT[T any](f BeanFactory) (map[string]T, error) {
+// GetBeanByNameT 按【名称】类型安全地获取 bean，省去 GetBean(name) 后的类型断言。
+func GetBeanByNameT[T any](f BeanFactory, name string) (T, error) {
 	var zero T
+	v, err := f.GetBean(name)
+	if err != nil {
+		return zero, err
+	}
+	ct, ok := v.(T)
+	if !ok {
+		return zero, ErrBeanNotOfRequiredType
+	}
+	return ct, nil
+}
+
+// MustGetBeanByNameT 按【名称】类型安全地获取 bean，失败 panic。
+func MustGetBeanByNameT[T any](f BeanFactory, name string) T {
+	v, err := GetBeanByNameT[T](f, name)
+	if err != nil {
+		panic(err)
+	}
+	return v
+}
+
+// GetBeansT 获取某类型的所有 bean（泛型集合注入，对应 Spring List<T> 注入）。
+// T 通常为接口类型，返回所有实现该接口的 bean。
+func GetBeansT[T any](f BeanFactory) (map[string]T, error) {
 	t := reflect.TypeOf((*T)(nil)).Elem()
 	raw, err := f.GetBeansOfType(t)
 	if err != nil {
@@ -145,7 +173,7 @@ func GetBeansT[T any](f BeanFactory) (map[string]T, error) {
 			return nil, ErrBeanNotOfRequiredType
 		}
 		out[k] = cv
-		_ = zero
 	}
 	return out, nil
 }
+
