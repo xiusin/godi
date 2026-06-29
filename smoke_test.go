@@ -112,13 +112,13 @@ func TestSmoke_GenericGetByName(t *testing.T) {
 		Type:    reflect.TypeOf((*DB1)(nil)),
 		Factory: func(_ BeanFactory) (any, error) { return &DB1{Name: "g"}, nil },
 	})
-	// 类型安全按名称获取
-	db, err := GetBeanByNameT[*DB1](f, "db")
+	// 类型安全按名称获取（泛型方法）
+	db, err := f.GetBeanByNameT[*DB1]("db")
 	if err != nil || db.Name != "g" {
 		t.Fatalf("GetBeanByNameT failed: %v %v", db, err)
 	}
 	// 类型不匹配应返回 ErrBeanNotOfRequiredType
-	_, err = GetBeanByNameT[*Svc1](f, "db")
+	_, err = f.GetBeanByNameT[*Svc1]("db")
 	if !errors.Is(err, ErrBeanNotOfRequiredType) {
 		t.Fatalf("expect ErrBeanNotOfRequiredType, got %v", err)
 	}
@@ -132,7 +132,8 @@ func TestSmoke_GenericGetByType(t *testing.T) {
 		Primary: true,
 		Factory: func(_ BeanFactory) (any, error) { return &Svc1{}, nil },
 	})
-	svc, err := GetBeanT[*Svc1](f)
+	// 泛型方法按类型获取
+	svc, err := f.GetBeanT[*Svc1]()
 	if err != nil || svc == nil {
 		t.Fatalf("GetBeanT failed: %v %v", svc, err)
 	}

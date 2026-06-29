@@ -103,10 +103,10 @@ func main() {
 
 	// 使用
 	fmt.Println("\n=== Using beans ===")
-	// 泛型 API：按类型获取（无需类型断言）
-	svc, _ := godi.GetBeanT[*UserService](f)
-	// 泛型 API：按名称获取（同样无需类型断言）
-	db := godi.MustGetBeanByNameT[*DB](f, "db")
+	// 泛型方法（Go 1.27+）：按类型获取，无需类型断言
+	svc, _ := f.GetBeanT[*UserService]()
+	// 泛型方法：按名称获取，同样无需类型断言
+	db := f.MustGetBeanByNameT[*DB]("db")
 	fmt.Printf("DB DSN: %s\n", db.DSN)
 	fmt.Printf("User count: %d\n", svc.GetUserCount())
 	fmt.Printf("User count: %d\n", svc.GetUserCount())

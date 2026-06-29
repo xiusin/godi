@@ -2,6 +2,9 @@
 
 `godi` 是一个生产级 Go 依赖注入容器，深度复刻 Spring IoC 的核心机制，包含 **三级缓存解决 setter 循环依赖**、BeanPostProcessor 扩展点、byType 自动装配、父子容器、生命周期回调等完整能力。
 
+> **Go 版本要求**：Go 1.27+（利用泛型方法特性，提案 [#77273](https://github.com/golang/go/issues/77273)）。
+> 如需在 Go 1.18–1.26 上使用，请使用 `v1` 分支（包级泛型函数 API）。
+
 ---
 
 ## 目录
@@ -490,46 +493,50 @@ godi.RegisterBean("reqUser", &godi.BeanDefinition{
 
 ### 泛型 API
 
-Go 1.18+ 提供类型安全的泛型 API，消除调用方类型断言。
-
-> **关于泛型方法**：Go 的方法（method）目前不能声明自己的类型参数，因此这些 API 是包级泛型函数。
-> 泛型方法提案（[#77273](https://github.com/golang/go/issues/77273)）已于 2026 年 1 月被接受，
-> 待正式发布后可平滑迁移为 `f.GetBeanT[T]()` 方法形式。
+利用 Go 1.27 泛型方法特性，提供类型安全的 bean 获取 API，消除调用方类型断言。
 
 ```go
+// 实例化容器
+f := godi.NewDefaultBeanFactory()
+
 // 按【名称】获取 —— 替代 GetBean(name).(*DB)
-db, err := godi.GetBeanByNameT[*DB](f, "db")
+db, err := f.GetBeanByNameT[*DB]("db")
 if err != nil {
     return err
 }
 db.Query(...) // 直接使用，无需类型断言
 
 // 按【名称】获取，失败 panic
-db := godi.MustGetBeanByNameT[*DB](f, "db")
+db := f.MustGetBeanByNameT[*DB]("db")
 
 // 按【类型】获取 —— 替代 GetBeanByType(reflect.TypeOf(...))
-db, err := godi.GetBeanT[*DB](f)
+db, err := f.GetBeanT[*DB]()
 
 // 按【类型】获取，失败 panic
-db := godi.MustGetBeanT[*DB](f)
+db := f.MustGetBeanT[*DB]()
 
 // 接口类型同样适用（byType 自动匹配实现类）
-var log Logger = godi.MustGetBeanT[Logger](f)
+var log Logger = f.MustGetBeanT[Logger]()
 
 // 获取某类型所有 bean（泛型集合注入，对应 Spring List<T>）
-plugins, err := godi.GetBeansT[Plugin](f)
+plugins, err := f.GetBeansT[Plugin]()
 for name, p := range plugins {
     p.Run()
 }
 ```
 
-| 泛型函数 | 对应非泛型 API | 说明 |
+> **Go 1.27 泛型方法**：这些 API 是 `*DefaultBeanFactory` 的方法，利用了 Go 1.27 泛型方法特性（提案 [#77273](https://github.com/golang/go/issues/77273)）。
+> 泛型方法不能用于匹配接口（Go 语言约束），因此定义在具体类型 `*DefaultBeanFactory` 上，而非 `BeanFactory` 接口上。
+
+| 泛型方法 | 对应非泛型 API | 说明 |
 |---|---|---|
-| `GetBeanByNameT[T](f, name)` | `GetBean(name)` | 按名称 + 类型安全 |
-| `MustGetBeanByNameT[T](f, name)` | `MustGetBean(name)` | 按名称，失败 panic |
-| `GetBeanT[T](f)` | `GetBeanByType(t)` | 按类型 + 类型安全 |
-| `MustGetBeanT[T](f)` | — | 按类型，失败 panic |
-| `GetBeansT[T](f)` | `GetBeansOfType(t)` | 集合注入 |
+| `f.GetBeanByNameT[T](name)` | `f.GetBean(name)` | 按名称 + 类型安全 |
+| `f.MustGetBeanByNameT[T](name)` | `f.MustGetBean(name)` | 按名称，失败 panic |
+| `f.GetBeanT[T]()` | `f.GetBeanByType(t)` | 按类型 + 类型安全 |
+| `f.MustGetBeanT[T]()` | — | 按类型，失败 panic |
+| `f.GetBeansT[T]()` | `f.GetBeansOfType(t)` | 集合注入 |
+
+> **全局容器便捷 API**：操作全局默认容器时，可使用包级泛型函数 `godi.GetBeanT[T]()`、`godi.MustGetBeanT[T]()` 等，底层调用 `defaultFactory` 的对应泛型方法。
 
 ---
 
@@ -663,7 +670,7 @@ func main() {
     }
 
     // 使用
-    svc := godi.MustGetBeanT[*UserService](f)
+    svc := f.MustGetBeanT[*UserService]()
     fmt.Printf("DB DSN: %s\n", svc.DB.DSN)
     svc.Log.Log("hello")
 
